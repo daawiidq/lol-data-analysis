@@ -23,3 +23,8 @@ This project analyzes League of Legends match data to understand player performa
 ```bash
 pip install pandas matplotlib
 python analysis.py
+
+## Sample Output
+
+![Win Rates](top10_champion_winrates.png)
+![KDA](top10_champion_kda.png)
