@@ -47,6 +47,11 @@ python analysis.py
 
 ## Sample Output
 
-![Win Rates](top10_champion_winrates.png)
 
-![KDA](top10_champion_kda.png)
+![Win Rate by Duration](winrate_by_duration.png)
+
+![First Blood Impact](first_blood_impact.png)
+
+![Dragon Impact](dragon_impact.png)
+
+![Baron Impact](baron_impact.png)
