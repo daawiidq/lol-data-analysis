@@ -1,113 +1,186 @@
-import pandas as pd
+from pathlib import Path
+import math
+
 import matplotlib.pyplot as plt
+import pandas as pd
+
+DATA_FILE = Path(__file__).with_name("matches.csv")
+OUTPUT_DIR = Path(__file__).parent
+
+REQUIRED_COLUMNS = [
+    "gameDuration",
+    "winner",
+    "firstBlood",
+    "firstDragon",
+    "firstBaron",
+]
 
 
-def main():
-    # Load dataset
-    file_name = "matches.csv"
-    df = pd.read_csv(file_name)
+def wilson_interval(successes: int, total: int, z: float = 1.96) -> tuple[float, float]:
+    """Return a Wilson score interval for a Bernoulli proportion."""
+    if total <= 0:
+        return (math.nan, math.nan)
 
-    print("=== First 5 Rows ===")
-    print(df.head())
-    print()
+    p = successes / total
+    denominator = 1 + (z**2 / total)
+    center = (p + (z**2 / (2 * total))) / denominator
+    margin = (
+        z
+        * math.sqrt((p * (1 - p) + z**2 / (4 * total)) / total)
+        / denominator
+    )
+    return center - margin, center + margin
 
-    print("=== Columns ===")
-    print(df.columns.tolist())
-    print()
 
-    # Keep only needed columns if they exist
-    required_columns = ["champion", "win", "kills", "deaths", "assists"]
-    missing_columns = [col for col in required_columns if col not in df.columns]
+def load_matches(path: Path = DATA_FILE) -> pd.DataFrame:
+    df = pd.read_csv(path, usecols=REQUIRED_COLUMNS)
 
-    if missing_columns:
-        print("Error: Missing required columns:", missing_columns)
-        print("Please check your CSV file column names.")
-        return
+    missing = [column for column in REQUIRED_COLUMNS if column not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
 
-    # Drop missing rows
-    df = df.dropna(subset=required_columns)
+    for column in REQUIRED_COLUMNS:
+        df[column] = pd.to_numeric(df[column], errors="coerce")
 
-    # Make sure numeric columns are numeric
-    numeric_cols = ["win", "kills", "deaths", "assists"]
-    for col in numeric_cols:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["gameDuration", "winner"]).copy()
+    df = df[df["winner"].isin([1, 2])]
+    df["duration_min"] = df["gameDuration"] / 60.0
+    return df
 
-    df = df.dropna(subset=numeric_cols)
 
-    # Convert win column to integer if possible
-    df["win"] = df["win"].astype(int)
+def objective_summary(df: pd.DataFrame, column: str) -> dict[str, float]:
+    recorded = df[df[column].isin([1, 2])].copy()
+    won_after_objective = recorded[column].eq(recorded["winner"])
 
-    # Calculate KDA
-    # Avoid division by zero by replacing 0 deaths with 1
-    df["kda"] = (df["kills"] + df["assists"]) / df["deaths"].replace(0, 1)
+    total = int(len(recorded))
+    wins = int(won_after_objective.sum())
+    rate = wins / total if total else math.nan
+    low, high = wilson_interval(wins, total)
 
-    # Overall win rate
-    overall_win_rate = df["win"].mean()
-    print(f"=== Overall Win Rate ===\n{overall_win_rate:.2%}\n")
+    return {
+        "metric": column,
+        "games": total,
+        "wins_by_objective_team": wins,
+        "win_rate": rate,
+        "ci95_low": low,
+        "ci95_high": high,
+    }
 
-    # Champion statistics
-    champion_stats = (
-        df.groupby("champion")
-        .agg(
-            games_played=("champion", "count"),
-            win_rate=("win", "mean"),
-            avg_kills=("kills", "mean"),
-            avg_deaths=("deaths", "mean"),
-            avg_assists=("assists", "mean"),
-            avg_kda=("kda", "mean"),
+
+def duration_summary(df: pd.DataFrame) -> pd.DataFrame:
+    bins = [0, 25, 30, 35, 40, float("inf")]
+    labels = ["<25", "25-30", "30-35", "35-40", "40+"]
+
+    working = df.copy()
+    working["duration_bin"] = pd.cut(
+        working["duration_min"],
+        bins=bins,
+        labels=labels,
+        right=False,
+        include_lowest=True,
+    )
+    working["team1_win"] = working["winner"].eq(1)
+
+    records = []
+    for label in labels:
+        group = working[working["duration_bin"] == label]
+        total = int(len(group))
+        wins = int(group["team1_win"].sum())
+        rate = wins / total if total else math.nan
+        low, high = wilson_interval(wins, total)
+        records.append(
+            {
+                "duration_bin_min": label,
+                "games": total,
+                "team1_win_rate": rate,
+                "ci95_low": low,
+                "ci95_high": high,
+            }
         )
-        .sort_values(by="win_rate", ascending=False)
+
+    return pd.DataFrame(records)
+
+
+def save_duration_plot(summary: pd.DataFrame) -> None:
+    x = range(len(summary))
+    y = summary["team1_win_rate"] * 100
+    lower = (summary["team1_win_rate"] - summary["ci95_low"]) * 100
+    upper = (summary["ci95_high"] - summary["team1_win_rate"]) * 100
+
+    plt.figure(figsize=(9, 5))
+    plt.errorbar(x, y, yerr=[lower, upper], fmt="o", capsize=4)
+    plt.axhline(50, linewidth=1)
+    plt.xticks(list(x), summary["duration_bin_min"])
+    plt.xlabel("Game duration (minutes)")
+    plt.ylabel("Team 1 win rate (%)")
+    plt.title("Team 1 Win Rate by Game Duration")
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR / "winrate_by_duration.png", dpi=160)
+    plt.close()
+
+
+def save_objective_plot(label: str, row: dict[str, float], filename: str) -> None:
+    rate = row["win_rate"] * 100
+    low = (row["win_rate"] - row["ci95_low"]) * 100
+    high = (row["ci95_high"] - row["win_rate"]) * 100
+
+    plt.figure(figsize=(6, 5))
+    plt.bar([label], [rate])
+    plt.errorbar([0], [rate], yerr=[[low], [high]], fmt="none", capsize=5)
+    plt.axhline(50, linewidth=1)
+    plt.ylim(0, 100)
+    plt.ylabel("Win rate of team securing objective (%)")
+    plt.title(f"{label} and Match Outcome")
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR / filename, dpi=160)
+    plt.close()
+
+
+def main() -> None:
+    df = load_matches()
+
+    team1_rate = df["winner"].eq(1).mean()
+    print(f"Games analyzed: {len(df):,}")
+    print(f"Median game duration: {df['duration_min'].median():.2f} minutes")
+    print(f"Team 1 win rate: {team1_rate:.2%}")
+
+    duration = duration_summary(df)
+    objectives = pd.DataFrame(
+        [
+            objective_summary(df, "firstBlood"),
+            objective_summary(df, "firstDragon"),
+            objective_summary(df, "firstBaron"),
+        ]
     )
 
-    print("=== Top 10 Champions by Win Rate ===")
-    print(champion_stats.head(10))
-    print()
+    print("\nObjective associations")
+    for row in objectives.to_dict(orient="records"):
+        print(
+            f"{row['metric']}: {row['win_rate']:.2%} "
+            f"(95% CI {row['ci95_low']:.2%}-{row['ci95_high']:.2%}, "
+            f"n={int(row['games']):,})"
+        )
 
-    # Save full stats
-    champion_stats.to_csv("champion_stats_summary.csv")
+    duration.to_csv(OUTPUT_DIR / "duration_summary.csv", index=False)
+    objectives.to_csv(OUTPUT_DIR / "objective_summary.csv", index=False)
 
-    # Filter champions with at least 5 games to reduce noise
-    filtered_stats = champion_stats[champion_stats["games_played"] >= 5]
+    save_duration_plot(duration)
+    for label, metric, filename in [
+        ("First Blood", "firstBlood", "first_blood_impact.png"),
+        ("First Dragon", "firstDragon", "dragon_impact.png"),
+        ("First Baron", "firstBaron", "baron_impact.png"),
+    ]:
+        row = objective_summary(df, metric)
+        save_objective_plot(label, row, filename)
 
-    # Top 10 win rates
-    top10_winrate = filtered_stats.sort_values(by="win_rate", ascending=False).head(10)
-
-    # Top 10 KDA
-    top10_kda = filtered_stats.sort_values(by="avg_kda", ascending=False).head(10)
-
-    # Plot 1: Top 10 champion win rates
-    plt.figure(figsize=(10, 6))
-    plt.bar(top10_winrate.index, top10_winrate["win_rate"])
-    plt.title("Top 10 Champion Win Rates")
-    plt.xlabel("Champion")
-    plt.ylabel("Win Rate")
-    plt.xticks(rotation=45)
-    plt.tight_layout()
-    plt.savefig("top10_champion_winrates.png")
-    plt.show()
-
-    # Plot 2: Top 10 champion average KDA
-    plt.figure(figsize=(10, 6))
-    plt.bar(top10_kda.index, top10_kda["avg_kda"])
-    plt.title("Top 10 Champion Average KDA")
-    plt.xlabel("Champion")
-    plt.ylabel("Average KDA")
-    plt.xticks(rotation=45)
-    plt.tight_layout()
-    plt.savefig("top10_champion_kda.png")
-    plt.show()
-
-    # Correlation-style insight
-    avg_win_by_kda = df.groupby(pd.cut(df["kda"], bins=5))["win"].mean()
-    print("=== Win Rate by KDA Range ===")
-    print(avg_win_by_kda)
-    print()
-
-    print("Analysis complete.")
-    print("Generated files:")
-    print("- champion_stats_summary.csv")
-    print("- top10_champion_winrates.png")
-    print("- top10_champion_kda.png")
+    print("\nGenerated:")
+    print("- duration_summary.csv")
+    print("- objective_summary.csv")
+    print("- winrate_by_duration.png")
+    print("- first_blood_impact.png")
+    print("- dragon_impact.png")
+    print("- baron_impact.png")
+    print("\nThese are descriptive associations, not causal effects.")
 
 
 if __name__ == "__main__":
