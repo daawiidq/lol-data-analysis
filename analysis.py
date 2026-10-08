@@ -1,5 +1,6 @@
 from pathlib import Path
 import math
+import json
 
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -8,6 +9,7 @@ DATA_FILE = Path(__file__).with_name("matches.csv")
 OUTPUT_DIR = Path(__file__).parent
 
 REQUIRED_COLUMNS = [
+    "gameId",
     "gameDuration",
     "winner",
     "firstBlood",
@@ -33,18 +35,27 @@ def wilson_interval(successes: int, total: int, z: float = 1.96) -> tuple[float,
 
 
 def load_matches(path: Path = DATA_FILE) -> pd.DataFrame:
-    df = pd.read_csv(path, usecols=REQUIRED_COLUMNS)
-
-    missing = [column for column in REQUIRED_COLUMNS if column not in df.columns]
+    raw = pd.read_csv(path)
+    missing = [column for column in REQUIRED_COLUMNS if column not in raw.columns]
     if missing:
         raise ValueError(f"Missing required columns: {missing}")
-
+    # Deduplicate full source rows before projecting to the analysis columns.
+    unique = raw.drop_duplicates().copy()
+    if unique["gameId"].duplicated().any():
+        raise ValueError("Conflicting records for a gameId; investigate rather than arbitrarily keeping one.")
+    df = unique[REQUIRED_COLUMNS].copy()
     for column in REQUIRED_COLUMNS:
         df[column] = pd.to_numeric(df[column], errors="coerce")
-
-    df = df.dropna(subset=["gameDuration", "winner"]).copy()
-    df = df[df["winner"].isin([1, 2])]
+    valid = df.notna().all(axis=1) & df.mod(1).eq(0).all(axis=1)
+    valid &= df["gameId"].gt(0) & df["gameDuration"].gt(0) & df["winner"].isin([1, 2])
+    for column in ["firstBlood", "firstDragon", "firstBaron"]:
+        valid &= df[column].isin([0, 1, 2])
+    df = df.loc[valid].copy()
+    if df.empty:
+        raise ValueError("No valid matches remain")
     df["duration_min"] = df["gameDuration"] / 60.0
+    df.attrs["audit"] = {"input_rows": len(raw), "exact_duplicates_removed": len(raw)-len(unique),
+                         "invalid_rows_removed": int((~valid).sum()), "matches_analyzed": len(df)}
     return df
 
 
@@ -139,6 +150,7 @@ def save_objective_plot(label: str, row: dict[str, float], filename: str) -> Non
 def main() -> None:
     df = load_matches()
 
+    (OUTPUT_DIR / "data_quality.json").write_text(json.dumps(df.attrs["audit"], indent=2) + "\n")
     team1_rate = df["winner"].eq(1).mean()
     print(f"Games analyzed: {len(df):,}")
     print(f"Median game duration: {df['duration_min'].median():.2f} minutes")
